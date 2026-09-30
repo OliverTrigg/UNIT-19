@@ -1,0 +1,1 @@
+This is a compilation of different projects and variations that we had been making during the development of our science fair game. We have now fully decided on focusing on a sphero bolt and drone game.
