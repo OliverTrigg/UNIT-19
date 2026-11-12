@@ -14,15 +14,6 @@ import time
 pygame.init()
 pygame.mouse.set_visible(False)
 
-# ============================================================
-# DRONE VS SPHERO - FIRST PERSON STYLE PROTOTYPE
-# Controls:
-#   WASD / Arrow keys = move/aim the drone
-#   SPACE / Left mouse = shoot
-#   1-5 = choose an upgrade
-#   ESC = quit
-# ============================================================
-
 WIDTH, HEIGHT = 1100, 700
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Drone vs Sphero - Cybersecurity Prototype")
@@ -172,6 +163,42 @@ UPGRADES = [
     ("AI SCAN", "Temporarily highlights the Sphero through the arena."),
     ("HEALTH +25", "Adds 25 to your maximum drone health."),
 ]
+
+LEADERBOARD_FILE = os.path.join(os.path.dirname(__file__), "leaderboard.json")
+LEADERBOARD_LIMIT = 8
+
+
+def load_leaderboard():
+    """Load the saved leaderboard from disk."""
+    try:
+        if not os.path.exists(LEADERBOARD_FILE):
+            return []
+        with open(LEADERBOARD_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+
+        cleaned = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "PLAYER")).strip() or "PLAYER"
+            score = int(entry.get("score", 0) or 0)
+            cleaned.append({"name": name[:12].upper(), "score": max(0, score)})
+
+        return sorted(cleaned, key=lambda item: item["score"], reverse=True)[:LEADERBOARD_LIMIT]
+    except Exception:
+        return []
+
+
+def save_leaderboard(entries):
+    """Persist the sorted leaderboard and cap the number of entries."""
+    try:
+        sorted_entries = sorted(entries, key=lambda item: item["score"], reverse=True)[:LEADERBOARD_LIMIT]
+        with open(LEADERBOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted_entries, f, indent=2)
+    except Exception:
+        pass
 
 # ------------------------------------------------------------
 # Weapons
@@ -1287,6 +1314,10 @@ class Game:
         self.drone_camera_available = False
         self.drone_camera_error = ""
         self.drone_camera_frame = None
+        self.leaderboard = load_leaderboard()
+        self.player_name = "PLAYER"
+        self.score_logged = False
+        self.name_editing = True
 
         self.drone_max_hp = 100
         self.drone_hp = 100
@@ -1343,13 +1374,62 @@ class Game:
         self._equip_hover_index = None
         self._question_hover_index = None
 
+    def record_run_score(self):
+        """Save the final outcome to the leaderboard once per run."""
+        if self.score_logged or self.score <= 0:
+            return
+
+        self.score_logged = True
+        leaderboard = load_leaderboard()
+        leaderboard.append({"name": self.player_name[:12].upper() or "PLAYER", "score": int(self.score)})
+        save_leaderboard(leaderboard)
+        self.leaderboard = load_leaderboard()
+
+    def update_player_name(self, event):
+        """Handle keyboard input for editing the player name on the menu."""
+        if event.key == pygame.K_BACKSPACE:
+            if self.player_name and self.player_name.upper() != "PLAYER":
+                self.player_name = self.player_name[:-1]
+            elif self.player_name.upper() == "PLAYER":
+                self.player_name = ""
+            if not self.player_name.strip():
+                self.player_name = "PLAYER"
+            return
+
+        if event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_TAB):
+            return
+
+        if event.unicode and event.unicode.isprintable():
+            char = event.unicode
+            if char in ("\n", "\r"):
+                return
+
+            cleaned = char.strip()
+            if not cleaned:
+                return
+
+            # If the placeholder is still active, replace it on first real input.
+            if self.player_name.upper() == "PLAYER" and self.player_name.strip() == "PLAYER":
+                self.player_name = ""
+
+            if len(self.player_name) < 12:
+                self.player_name += char
+
+        self.player_name = self.player_name[:12].upper()
+        if not self.player_name.strip():
+            self.player_name = "PLAYER"
+
     def enemy_damage(self):
-        """Keep boss pressure threatening but reasonable."""
+        """Regular enemies hit a bit harder while boss pressure stays unchanged."""
         capped_level = min(self.level, 12)
-        base = 2 + capped_level // 3
-        if self.level == 99:
-            return max(1, base - 1)
-        return max(1, base)
+
+        if self.sphero and getattr(self.sphero, "is_boss", False):
+            base = 2 + capped_level // 3
+            if self.level == 99:
+                return max(1, base - 1)
+            return max(1, base)
+
+        return max(1, 3 + capped_level // 3)
 
     def set_menu_mode(self, index):
         options = ["computer"]
@@ -1399,10 +1479,26 @@ class Game:
         self.game_mode = ["computer"][self.menu_selection]
         self.level = 1
         self.upgrades = []
+        self.available_upgrades = []
+        self.selected_upgrade = None
         self.final_boss_unlocked = False
         self.final_boss_defeated = False
+        self.pending_health_penalty = 0
+        self.pending_level_heal = 0
+        self.questions_correct = 0
+        self.question_mistakes = 0
+        self.current_question = None
+        self.question_pool = []
+        self.selected_answer = None
+        self.question_feedback = ""
         self.drone_max_hp = 100
+        self.drone_hp = 100
         self.score = 0
+        self.score_logged = False
+        self.unlocked_weapons = [WEAPONS[0][0]]
+        self.equipped_weapon = WEAPONS[0][0]
+        self.shield_active = False
+        self.ai_scan_timer = 0.0
         self.start_level()
 
     def start_level(self):
@@ -1624,6 +1720,7 @@ class Game:
                 self.pending_level_heal = 10
                 if self.final_boss_unlocked and self.level == 99:
                     self.final_boss_defeated = True
+                    self.record_run_score()
                     self.state = "win_screen"
                     self.message = "FINAL BOSS DEFEATED!"
                     self.message_timer = 2.0
@@ -1714,6 +1811,7 @@ class Game:
                     self.damage_flash = 0.18
                     self.sphero.projectiles.remove(projectile)
                     if self.drone_hp <= 0:
+                        self.record_run_score()
                         self.state = "game_over"
                         break
 
@@ -1731,10 +1829,12 @@ class Game:
                 self.damage_flash = 0.18
 
                 if self.drone_hp <= 0:
+                    self.record_run_score()
                     self.state = "game_over"
 
             if self.time_left <= 0:
                 self.time_left = 0
+                self.record_run_score()
                 self.state = "level_failed"
 
     def draw_background(self):
@@ -1910,6 +2010,33 @@ class Game:
         pygame.draw.polygon(screen, cursor_colour, [(px, py) for px, py in points], 0)
         pygame.draw.line(screen, (255, 255, 255), (x + 1, y + 2), (x + 9, y + 10), 2)
 
+    def draw_leaderboard_panel(self, x, y, width, height, title="TOP SCORES"):
+        panel = pygame.Rect(x, y, width, height)
+        pygame.draw.rect(screen, (16, 20, 28), panel, border_radius=18)
+        pygame.draw.rect(screen, CYAN, panel, 2, border_radius=18)
+
+        header = pygame.Rect(panel.x + 14, panel.y + 12, panel.width - 28, 34)
+        pygame.draw.rect(screen, (26, 36, 42), header, border_radius=10)
+        draw_text(title, FONT, YELLOW, header.x + 12, header.y + 5)
+
+        entries = self.leaderboard if self.leaderboard else [{"name": "NO SCORES", "score": 0}]
+        for i, entry in enumerate(entries[:5]):
+            row_y = panel.y + 62 + i * 42
+            row = pygame.Rect(panel.x + 10, row_y, panel.width - 20, 30)
+            pygame.draw.rect(screen, (20, 28, 36), row, border_radius=8)
+            draw_text(f"{i + 1}.", SMALL, CYAN, row.x + 10, row.y + 5)
+            draw_text(f"{entry['name']}", SMALL, WHITE, row.x + 42, row.y + 5)
+            draw_text(f"{entry['score']}", SMALL, GREEN, row.right - 60, row.y + 5)
+
+        if len(entries) < 5:
+            for i in range(len(entries), 5):
+                row_y = panel.y + 62 + i * 42
+                row = pygame.Rect(panel.x + 10, row_y, panel.width - 20, 30)
+                pygame.draw.rect(screen, (20, 28, 36), row, border_radius=8)
+                draw_text(f"{i + 1}.", SMALL, GREY, row.x + 10, row.y + 5)
+                draw_text("---", SMALL, GREY, row.x + 42, row.y + 5)
+                draw_text("0", SMALL, GREY, row.right - 60, row.y + 5)
+
     def draw_hud(self):
         # Top HUD with layered cyber panels.
         top_panel = pygame.Rect(0, 0, WIDTH, 80)
@@ -2001,27 +2128,14 @@ class Game:
     def draw_menu(self):
         screen.fill(BLACK)
 
-        draw_text("DRONE VS SPHERO", TITLE, CYAN, WIDTH // 2, 125, center=True)
-        draw_text("CYBERSECURITY TRAINING PROTOTYPE", FONT, WHITE, WIDTH // 2, 185, center=True)
+        draw_text("DRONE VS SPHERO", TITLE, CYAN, WIDTH // 2, 90, center=True)
+        draw_text("CYBERSECURITY TRAINING PROTOTYPE", FONT, WHITE, WIDTH // 2, 150, center=True)
 
-        box = pygame.Rect(180, 220, WIDTH - 360, 390)
-        pygame.draw.rect(screen, DARK_GREY, box, border_radius=15)
-        pygame.draw.rect(screen, CYAN, box, 2, border_radius=15)
+        mission_box = pygame.Rect(90, 190, 620, 400)
+        pygame.draw.rect(screen, (18, 24, 32), mission_box, border_radius=18)
+        pygame.draw.rect(screen, CYAN, mission_box, 2, border_radius=18)
 
-        title_y = box.y + 35
-        draw_text("MISSION", BIG, YELLOW, WIDTH // 2, title_y, center=True)
-
-        opts = [
-            ("1. Computer Mode", "Regular base game (mouse + keyboard)"),
-        ]
-
-        opt_h = 68
-        spacing = 12
-        opt_y = box.y + 205
-
-        mission_top = title_y + 48
-        mission_bottom = opt_y - 18
-        mission_h = max(96, mission_bottom - mission_top)
+        draw_text("MISSION", BIG, YELLOW, mission_box.centerx, 218, center=True)
 
         mission = (
             "Use the drone to find and hit the AI-controlled Sphero BOLT. "
@@ -2029,15 +2143,22 @@ class Game:
             "After each victory, answer 3 cybersecurity questions correctly "
             "to unlock an upgrade for the next level."
         )
+        draw_wrapped_text(mission, FONT, WHITE, pygame.Rect(mission_box.x + 28, mission_box.y + 72, mission_box.width - 56, 180), 8)
 
-        draw_wrapped_text(mission, FONT, WHITE, pygame.Rect(220, mission_top, WIDTH - 440, mission_h), 7)
+        opts = [
+            ("1. Computer Mode", "Regular base game (mouse + keyboard)"),
+        ]
 
+        opt_h = 74
+        spacing = 12
+        start_y = mission_box.y + 250
         self._menu_option_rects = []
+
         for i, (title, desc) in enumerate(opts):
-            w = 720
+            w = mission_box.width - 40
             h = opt_h
-            x = WIDTH // 2 - w // 2
-            y = opt_y + i * (h + spacing)
+            x = mission_box.x + 20
+            y = start_y + i * (h + spacing)
             rect = pygame.Rect(x, y, w, h)
             self._menu_option_rects.append((rect, i))
 
@@ -2075,12 +2196,23 @@ class Game:
             pygame.draw.circle(screen, CYAN if i == self.menu_selection else GREY, (icon_cx, icon_cy), icon_r)
             draw_text(str(i + 1), SMALL, (8, 12, 18), icon_cx, icon_cy, center=True)
 
-            draw_text(title, FONT, WHITE if (i == self.menu_selection or mouse_over) else (200, 210, 215), rect.x + 92, rect.y + 10)
-            draw_text(desc, SMALL, (170, 178, 186), rect.x + 92, rect.y + 38)
+            draw_text(title, FONT, WHITE if (i == self.menu_selection or mouse_over) else (200, 210, 215), rect.x + 92, rect.y + 12)
+            draw_text(desc, SMALL, (170, 178, 186), rect.x + 92, rect.y + 42)
 
-        instr_y = box.y + box.height + 18
+        name_box = pygame.Rect(760, 80, 220, 76)
+        glow = pygame.Surface((name_box.width + 12, name_box.height + 12), pygame.SRCALPHA)
+        pygame.draw.rect(glow, (96, 214, 255, 70), (6, 6, name_box.width, name_box.height), border_radius=20)
+        screen.blit(glow, (name_box.x - 6, name_box.y - 6))
+        pygame.draw.rect(screen, (20, 28, 36), name_box, border_radius=16)
+        pygame.draw.rect(screen, CYAN, name_box, 2, border_radius=16)
+        draw_text("PLAYER NAME", SMALL, YELLOW, name_box.x + 12, name_box.y + 10)
+        draw_text(self.player_name.upper(), FONT, WHITE, name_box.x + 14, name_box.y + 32)
+
+        self.draw_leaderboard_panel(750, 190, 260, 340)
+
+        instr_y = 620
         draw_text("Press ENTER to start the selected mode", FONT, GREEN, WIDTH // 2, instr_y, center=True)
-        draw_text("Use W/S or up/down to switch mode", SMALL, GREY, WIDTH // 2, instr_y + 30, center=True)
+        draw_text("Type a name before starting — BACKSPACE clears it", SMALL, GREY, WIDTH // 2, instr_y + 30, center=True)
         if self.drone_camera_error:
             draw_text(self.drone_camera_error[:64], SMALL, RED, WIDTH // 2, instr_y + 54, center=True)
 
@@ -2356,6 +2488,7 @@ class Game:
                   WIDTH // 2, 355, center=True)
         draw_text("Press ENTER to return to the menu.", FONT, GREEN,
                   WIDTH // 2, 430, center=True)
+        self.draw_leaderboard_panel(230, 470, 640, 170, "LEADERBOARD")
 
     def draw_failed(self):
         screen.fill((25, 8, 10))
@@ -2370,7 +2503,7 @@ class Game:
             center=True,
         )
         draw_text(
-            "Press ENTER to retry this level.",
+            "Press ENTER to return to the menu.",
             FONT,
             YELLOW,
             WIDTH // 2,
@@ -2385,6 +2518,7 @@ class Game:
             380,
             center=True,
         )
+        self.draw_leaderboard_panel(230, 430, 640, 170, "LEADERBOARD")
 
     def draw_game_over(self):
         screen.fill((25, 8, 10))
@@ -2399,7 +2533,7 @@ class Game:
             center=True,
         )
         draw_text(
-            "Press ENTER to retry this level.",
+            "Press ENTER to return to the menu.",
             FONT,
             YELLOW,
             WIDTH // 2,
@@ -2414,6 +2548,7 @@ class Game:
             380,
             center=True,
         )
+        self.draw_leaderboard_panel(230, 430, 640, 170, "LEADERBOARD")
 
     def draw(self):
         if self.state == "menu":
@@ -2479,12 +2614,20 @@ while running:
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 if game.state in ("level_failed", "game_over"):
+                    game.reset()
                     game.state = "menu"
                 else:
                     running = False
 
             elif game.state == "menu":
-                if event.key in (pygame.K_UP, pygame.K_w, pygame.K_DOWN, pygame.K_s):
+                is_name_input = (
+                    event.unicode and event.unicode.isprintable() and
+                    event.key not in (pygame.K_1, pygame.K_2, pygame.K_3)
+                )
+
+                if is_name_input or event.key == pygame.K_BACKSPACE:
+                    game.update_player_name(event)
+                elif event.key in (pygame.K_UP, pygame.K_w, pygame.K_DOWN, pygame.K_s):
                     game.set_menu_mode(0)
                 elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                     game.set_menu_mode(0)
@@ -2541,8 +2684,9 @@ while running:
                     game.state = "between_levels"
 
             elif game.state in ("level_failed", "game_over"):
-                if event.key == pygame.K_RETURN:
-                    game.start_level()
+                if event.key in (pygame.K_RETURN, pygame.K_ESCAPE):
+                    game.reset()
+                    game.state = "menu"
 
             elif game.state == "win_screen":
                 if event.key == pygame.K_RETURN:
